@@ -36,10 +36,12 @@ Create a repository, e.g. `khobornama-telegram-automation`, and upload these fil
 Repository -> Settings -> Secrets and variables -> Actions -> New repository secret:
 
 - `TELEGRAM_BOT_TOKEN`: token from BotFather
-- `TELEGRAM_CHAT_ID`: public channel username, e.g. `@khobornama`
-- `API_BASE_URL`: `https://api.khobornama.info.bd/api/`
+- `TELEGRAM_CHAT_ID`: public channel username, e.g. `@khobornamabd`
+- `FACEBOOK_PAGE_ID`: numeric Facebook Page ID (e.g. `123456789012345`)
+- `FACEBOOK_PAGE_ACCESS_TOKEN`: permanent Page Access Token with `pages_manage_posts`
+- `API_BASE_URL`: `https://api.khobornama.info.bd/api/` (optional, defaults automatically)
 
-Under Variables (not Secrets), add:
+Under Variables (or Secrets), add:
 
 - `NEWS_ENDPOINT`: actual news-list endpoint relative to API base, e.g. `news/`
 - `SITE_BASE_URL`: `https://khobornama.info.bd`

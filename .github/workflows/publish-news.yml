@@ -49,21 +49,24 @@ jobs:
           SITE_BASE_URL: ${{ secrets.SITE_BASE_URL || vars.SITE_BASE_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAX_NEWS_PER_RUN: "20"
+          FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID || vars.FACEBOOK_PAGE_ID }}
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN || vars.FACEBOOK_PAGE_ACCESS_TOKEN }}
           STATE_FILE: "data/posted_ids.json"
+          FB_STATE_FILE: "data/posted_facebook_ids.json"
+          MAX_NEWS_PER_RUN: "20"
           DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && (inputs.dry_run == true || inputs.dry_run == 'true')) && 'true' || 'false' }}
         run: python main.py
 
       - name: Commit updated publication state
         if: success()
         run: |
-          if git diff --quiet -- data/posted_ids.json; then
+          if git diff --quiet -- data/; then
             echo "No state changes."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/posted_ids.json
-          git commit -m "chore: update Telegram publication state"
+          git add data/posted_ids.json data/posted_facebook_ids.json
+          git commit -m "chore: update publication state [skip ci]"
           git pull --rebase origin main || true
           git push

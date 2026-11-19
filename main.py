@@ -25,6 +25,10 @@ SITE_BASE_URL = (os.getenv("SITE_BASE_URL") or "https://khobornama.info.bd").rst
 API_ORIGIN = f"{urlparse(API_BASE_URL).scheme}://{urlparse(API_BASE_URL).netloc}"
 MAX_NEWS_PER_RUN = int(os.getenv("MAX_NEWS_PER_RUN", "30"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "data/posted_ids.json"))
+FB_PAGE_ID = os.environ.get("FACEBOOK_PAGE_ID", "").strip()
+FB_ACCESS_TOKEN = os.environ.get("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
+FB_STATE_FILE = Path(os.getenv("FB_STATE_FILE", "data/posted_facebook_ids.json"))
+FB_API_VERSION = os.getenv("FB_API_VERSION", "v21.0")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
@@ -137,24 +141,24 @@ def article_fields(item):
     }
 
 
-def load_state():
-    if not STATE_FILE.exists():
+def load_state(file_path=STATE_FILE):
+    if not file_path.exists():
         return {"posted_ids": []}
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(file_path.read_text(encoding="utf-8"))
         if not isinstance(data.get("posted_ids"), list):
             return {"posted_ids": []}
         return data
     except (json.JSONDecodeError, OSError):
-        log.warning("State file unreadable; starting with empty state.")
+        log.warning("State file %s unreadable; starting with empty state.", file_path)
         return {"posted_ids": []}
 
 
-def save_state(state):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temp = STATE_FILE.with_suffix(".tmp")
+def save_state(state, file_path=STATE_FILE):
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = file_path.with_suffix(".tmp")
     temp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(STATE_FILE)
+    temp.replace(file_path)
 
 
 def clean_description(value, limit=450):
@@ -250,8 +254,134 @@ def telegram_publish_article(article):
         return telegram_send_message(article)
 
 
+def build_facebook_caption(article):
+    title = article["title"]
+    desc = clean_description(article["description"], limit=1500)
+    link = article["url"]
+
+    parts = [title]
+    if desc:
+        parts.append(desc)
+    parts.append(f"বিস্তারিত পড়ুন: {link}")
+    parts.append("#Khobornama #BangladeshNews")
+    return "\n\n".join(parts)
+
+
+def facebook_post(endpoint, payload):
+    response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
+    try:
+        data = response.json()
+    except Exception:
+        log.error("Facebook endpoint returned non-JSON (%s): %s", response.status_code, response.text[:200])
+        response.raise_for_status()
+        raise
+
+    if "error" in data:
+        err = data["error"]
+        msg = err.get("message", "Unknown Facebook error")
+        code = err.get("code", response.status_code)
+        subcode = err.get("error_subcode", "")
+        full_err = f"{code} (subcode {subcode}): {msg}" if subcode else f"{code}: {msg}"
+        print(f"::error title=Facebook API Error::{full_err}", flush=True)
+        log.error("Facebook API Error [%s]: %s", code, msg)
+        raise RuntimeError(f"Facebook API Error: {full_err}")
+
+    return data
+
+
+def facebook_publish_article(article):
+    caption = build_facebook_caption(article)
+    # Prefer photo post if image is available
+    if article.get("image"):
+        photo_endpoint = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PAGE_ID}/photos"
+        payload = {
+            "url": article["image"],
+            "caption": caption,
+            "access_token": FB_ACCESS_TOKEN,
+        }
+        if DRY_RUN:
+            log.info("[DRY RUN][FB] Would publish photo article %s: %s", article["id"], article["title"])
+            return {"id": f"dry-run-fb-{article['id']}"}
+
+        try:
+            return facebook_post(photo_endpoint, payload)
+        except Exception as exc:
+            log.warning("FB photo post failed for article %s (%s); trying feed fallback...", article["id"], exc)
+
+    # Fallback to feed post with link
+    feed_endpoint = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PAGE_ID}/feed"
+    payload = {
+        "message": caption,
+        "link": article["url"],
+        "access_token": FB_ACCESS_TOKEN,
+    }
+    if DRY_RUN:
+        log.info("[DRY RUN][FB] Would publish feed article %s: %s", article["id"], article["title"])
+        return {"id": f"dry-run-fb-{article['id']}"}
+
+    return facebook_post(feed_endpoint, payload)
+
+
+def publish_channel(channel_name, normalized_articles, state_file, publish_func):
+    state = load_state(state_file)
+    posted = set(str(x) for x in state["posted_ids"])
+    log.info("[%s] Loaded state: %d previously posted article IDs.", channel_name, len(posted))
+
+    new_articles = [a for a in normalized_articles if a["id"] not in posted]
+    new_articles.reverse()
+
+    total_new = len(new_articles)
+    if total_new > MAX_NEWS_PER_RUN:
+        log.info(
+            "[%s] Found %d new articles; capping to oldest %d for this run.",
+            channel_name,
+            total_new,
+            MAX_NEWS_PER_RUN,
+        )
+        new_articles = new_articles[:MAX_NEWS_PER_RUN]
+
+    log.info("[%s] Publishing %d articles in this run (total new discovered: %d).", channel_name, len(new_articles), total_new)
+
+    success_count = 0
+    for idx, article in enumerate(new_articles):
+        try:
+            result = publish_func(article)
+            if DRY_RUN:
+                log.info("[DRY RUN][%s] Not recording article=%s as posted.", channel_name, article["id"])
+                continue
+            posted.add(article["id"])
+            success_count += 1
+            post_id = result.get("id") or result.get("post_id") or result.get("message_id")
+            log.info(
+                "[%s][%d/%d] Published article=%s post_id=%s",
+                channel_name,
+                idx + 1,
+                len(new_articles),
+                article["id"],
+                post_id,
+            )
+            state["posted_ids"] = sorted(posted)
+            save_state(state, state_file)
+
+            # Polite delay between posts to prevent rate-limiting
+            if idx < len(new_articles) - 1 and not DRY_RUN:
+                time.sleep(2)
+        except Exception:
+            log.exception("[%s] Failed to publish article=%s title=%s", channel_name, article["id"], article["title"])
+            raise
+
+    log.info(
+        "[%s] Finished. Attempted=%d published=%d already_posted=%d",
+        channel_name,
+        len(new_articles),
+        success_count,
+        len(normalized_articles) - total_new,
+    )
+    return success_count
+
+
 def main():
-    log.info("=== Starting Khobornama Telegram Publisher ===")
+    log.info("=== Starting Khobornama Multi-Channel Auto Publisher ===")
     log.info(
         "Config: DRY_RUN=%s | MAX_NEWS_PER_RUN=%d | API_BASE_URL=%s | NEWS_ENDPOINT=%s",
         DRY_RUN,
@@ -259,21 +389,6 @@ def main():
         API_BASE_URL,
         NEWS_ENDPOINT,
     )
-
-    if not BOT_TOKEN:
-        print("::error title=Missing Secret::TELEGRAM_BOT_TOKEN environment variable is not set or empty.", flush=True)
-        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set or empty.")
-    if not CHAT_ID:
-        print("::error title=Missing Secret::TELEGRAM_CHAT_ID environment variable is not set or empty.", flush=True)
-        raise ValueError("TELEGRAM_CHAT_ID environment variable is not set or empty.")
-
-    masked_token = (BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:]) if len(BOT_TOKEN) > 10 else "(too short)"
-    print(f"::notice title=Config Info::CHAT_ID={CHAT_ID} | BOT_TOKEN={masked_token} (len={len(BOT_TOKEN)})", flush=True)
-    log.info("Credentials check: CHAT_ID=%s | BOT_TOKEN=%s (length=%d)", CHAT_ID, masked_token, len(BOT_TOKEN))
-
-    state = load_state()
-    posted = set(str(x) for x in state["posted_ids"])
-    log.info("Loaded state: %d previously posted article IDs.", len(posted))
 
     articles = fetch_news()
     log.info("Fetched %d news items from %s", len(articles), API_BASE_URL + NEWS_ENDPOINT)
@@ -286,54 +401,32 @@ def main():
             continue
         normalized.append(article)
 
-    # Publish oldest first so a batch of newly discovered articles appears chronologically.
-    new_articles = [a for a in normalized if a["id"] not in posted]
-    new_articles.reverse()
+    errors = []
 
-    total_new = len(new_articles)
-    if total_new > MAX_NEWS_PER_RUN:
-        log.info(
-            "Found %d new articles; capping to oldest %d for this run.",
-            total_new,
-            MAX_NEWS_PER_RUN,
-        )
-        new_articles = new_articles[:MAX_NEWS_PER_RUN]
-
-    log.info("Publishing %d articles in this run (total new discovered: %d).", len(new_articles), total_new)
-
-    success_count = 0
-    for idx, article in enumerate(new_articles):
+    # 1. Telegram Publication
+    if BOT_TOKEN and CHAT_ID:
+        masked_token = (BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:]) if len(BOT_TOKEN) > 10 else "(too short)"
+        log.info("[Telegram] Credentials OK: CHAT_ID=%s | BOT_TOKEN=%s (len=%d)", CHAT_ID, masked_token, len(BOT_TOKEN))
         try:
-            result = telegram_publish_article(article)
-            if DRY_RUN:
-                log.info("[DRY RUN] Not recording article=%s as posted.", article["id"])
-                continue
-            posted.add(article["id"])
-            success_count += 1
-            log.info(
-                "[%d/%d] Published article=%s telegram_message_id=%s",
-                idx + 1,
-                len(new_articles),
-                article["id"],
-                result.get("message_id"),
-            )
-            state["posted_ids"] = sorted(posted)
-            save_state(state)
+            publish_channel("Telegram", normalized, STATE_FILE, telegram_publish_article)
+        except Exception as exc:
+            errors.append(f"Telegram failed: {exc}")
+    else:
+        log.info("[Telegram] BOT_TOKEN or CHAT_ID not set; skipping Telegram.")
 
-            # Polite delay between Telegram posts to prevent rate-limiting (429 Too Many Requests)
-            if idx < len(new_articles) - 1 and not DRY_RUN:
-                time.sleep(2)
-        except Exception:
-            log.exception("Failed to publish article=%s title=%s", article["id"], article["title"])
-            # Stop at the first failure to preserve chronological order and retry next run.
-            raise
+    # 2. Facebook Page Publication
+    if FB_PAGE_ID and FB_ACCESS_TOKEN:
+        masked_fb_token = (FB_ACCESS_TOKEN[:6] + "..." + FB_ACCESS_TOKEN[-4:]) if len(FB_ACCESS_TOKEN) > 10 else "(too short)"
+        log.info("[Facebook] Credentials OK: PAGE_ID=%s | TOKEN=%s (len=%d)", FB_PAGE_ID, masked_fb_token, len(FB_ACCESS_TOKEN))
+        try:
+            publish_channel("Facebook", normalized, FB_STATE_FILE, facebook_publish_article)
+        except Exception as exc:
+            errors.append(f"Facebook failed: {exc}")
+    else:
+        log.info("[Facebook] FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN not set; skipping Facebook.")
 
-    log.info(
-        "Finished. Attempted=%d published=%d already_posted=%d",
-        len(new_articles),
-        success_count,
-        len(normalized) - total_new,
-    )
+    if errors:
+        raise RuntimeError(" | ".join(errors))
 
 
 if __name__ == "__main__":
