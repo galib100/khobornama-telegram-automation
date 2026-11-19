@@ -199,6 +199,7 @@ def telegram_post(endpoint, payload):
     if not data.get("ok"):
         desc = data.get("description", "Unknown Telegram error")
         error_code = data.get("error_code", response.status_code)
+        print(f"::error title=Telegram API Error::{error_code} - {desc}", flush=True)
         log.error("Telegram API Error [%s]: %s", error_code, desc)
         raise RuntimeError(f"Telegram API Error [{error_code}]: {desc}")
     return data["result"]
@@ -257,11 +258,14 @@ def main():
     )
 
     if not BOT_TOKEN:
+        print("::error title=Missing Secret::TELEGRAM_BOT_TOKEN environment variable is not set or empty.", flush=True)
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set or empty.")
     if not CHAT_ID:
+        print("::error title=Missing Secret::TELEGRAM_CHAT_ID environment variable is not set or empty.", flush=True)
         raise ValueError("TELEGRAM_CHAT_ID environment variable is not set or empty.")
 
     masked_token = (BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:]) if len(BOT_TOKEN) > 10 else "(too short)"
+    print(f"::notice title=Config Info::CHAT_ID={CHAT_ID} | BOT_TOKEN={masked_token} (len={len(BOT_TOKEN)})", flush=True)
     log.info("Credentials check: CHAT_ID=%s | BOT_TOKEN=%s (length=%d)", CHAT_ID, masked_token, len(BOT_TOKEN))
 
     state = load_state()
@@ -310,5 +314,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
+        print(f"::error title=Automation Failure::{exc}", flush=True)
         log.error("Automation failed: %s", exc)
         sys.exit(1)
