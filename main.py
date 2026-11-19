@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
@@ -69,8 +70,10 @@ def fetch_news():
     url = urljoin(API_BASE_URL, NEWS_ENDPOINT)
     collected = []
     seen_pages = set()
+    # Fetch at least 2 pages (or 2x MAX_NEWS_PER_RUN) to account for previously posted items
+    fetch_target = max(MAX_NEWS_PER_RUN * 2, 40)
 
-    while url and len(collected) < MAX_NEWS_PER_RUN:
+    while url and len(collected) < fetch_target:
         if url in seen_pages:
             log.warning("Pagination loop detected; stopping.")
             break
@@ -84,7 +87,7 @@ def fetch_news():
             break
         url = urljoin(API_BASE_URL, next_url)
 
-    return collected[:MAX_NEWS_PER_RUN]
+    return collected
 
 
 def first_value(item, *keys):
@@ -287,10 +290,19 @@ def main():
     new_articles = [a for a in normalized if a["id"] not in posted]
     new_articles.reverse()
 
-    log.info("Found %d new articles to publish.", len(new_articles))
+    total_new = len(new_articles)
+    if total_new > MAX_NEWS_PER_RUN:
+        log.info(
+            "Found %d new articles; capping to oldest %d for this run.",
+            total_new,
+            MAX_NEWS_PER_RUN,
+        )
+        new_articles = new_articles[:MAX_NEWS_PER_RUN]
+
+    log.info("Publishing %d articles in this run (total new discovered: %d).", len(new_articles), total_new)
 
     success_count = 0
-    for article in new_articles:
+    for idx, article in enumerate(new_articles):
         try:
             result = telegram_publish_article(article)
             if DRY_RUN:
@@ -298,16 +310,30 @@ def main():
                 continue
             posted.add(article["id"])
             success_count += 1
-            log.info("Published article=%s telegram_message_id=%s", article["id"], result.get("message_id"))
+            log.info(
+                "[%d/%d] Published article=%s telegram_message_id=%s",
+                idx + 1,
+                len(new_articles),
+                article["id"],
+                result.get("message_id"),
+            )
             state["posted_ids"] = sorted(posted)
             save_state(state)
+
+            # Polite delay between Telegram posts to prevent rate-limiting (429 Too Many Requests)
+            if idx < len(new_articles) - 1 and not DRY_RUN:
+                time.sleep(2)
         except Exception:
             log.exception("Failed to publish article=%s title=%s", article["id"], article["title"])
             # Stop at the first failure to preserve chronological order and retry next run.
             raise
 
-    log.info("Finished. New=%d published=%d already_posted=%d",
-             len(new_articles), success_count, len(normalized) - len(new_articles))
+    log.info(
+        "Finished. Attempted=%d published=%d already_posted=%d",
+        len(new_articles),
+        success_count,
+        len(normalized) - total_new,
+    )
 
 
 if __name__ == "__main__":
