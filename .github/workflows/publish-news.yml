@@ -10,7 +10,7 @@ on:
         description: "Test without posting or saving article IDs"
         required: true
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: write
@@ -43,7 +43,7 @@ jobs:
           SITE_BASE_URL: ${{ vars.SITE_BASE_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MAX_NEWS_PER_RUN: "30"
+          MAX_NEWS_PER_RUN: "1"
           STATE_FILE: "data/posted_ids.json"
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && 'true' || 'false' }}
         run: python main.py
