@@ -187,6 +187,23 @@ def build_caption(article):
     return caption
 
 
+def telegram_post(endpoint, payload):
+    response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
+    try:
+        data = response.json()
+    except Exception:
+        log.error("Telegram endpoint returned non-JSON (%s): %s", response.status_code, response.text[:200])
+        response.raise_for_status()
+        raise
+
+    if not data.get("ok"):
+        desc = data.get("description", "Unknown Telegram error")
+        error_code = data.get("error_code", response.status_code)
+        log.error("Telegram API Error [%s]: %s", error_code, desc)
+        raise RuntimeError(f"Telegram API Error [{error_code}]: {desc}")
+    return data["result"]
+
+
 def telegram_send_message(article):
     endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
@@ -199,12 +216,7 @@ def telegram_send_message(article):
         log.info("[DRY RUN] Would publish text-only article %s: %s", article["id"], article["title"])
         return {"message_id": f"dry-run-{article['id']}"}
 
-    response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(result.get("description", "Telegram API returned ok=false"))
-    return result["result"]
+    return telegram_post(endpoint, payload)
 
 
 def telegram_publish_article(article):
@@ -224,12 +236,7 @@ def telegram_publish_article(article):
         return {"message_id": f"dry-run-{article['id']}"}
 
     try:
-        response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        result = response.json()
-        if not result.get("ok"):
-            raise RuntimeError(result.get("description", "Telegram API returned ok=false"))
-        return result["result"]
+        return telegram_post(endpoint, payload)
     except Exception as exc:
         log.warning(
             "sendPhoto failed for article %s (%s); attempting text-only fallback...",
@@ -253,6 +260,9 @@ def main():
         raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set or empty.")
     if not CHAT_ID:
         raise ValueError("TELEGRAM_CHAT_ID environment variable is not set or empty.")
+
+    masked_token = (BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:]) if len(BOT_TOKEN) > 10 else "(too short)"
+    log.info("Credentials check: CHAT_ID=%s | BOT_TOKEN=%s (length=%d)", CHAT_ID, masked_token, len(BOT_TOKEN))
 
     state = load_state()
     posted = set(str(x) for x in state["posted_ids"])
