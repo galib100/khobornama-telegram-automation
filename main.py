@@ -16,10 +16,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("khobornama-telegram")
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://api.khobornama.info.bd/api/").rstrip("/") + "/"
+API_BASE_URL = (os.getenv("API_BASE_URL") or "https://api.khobornama.info.bd/api/").rstrip("/") + "/"
 NEWS_ENDPOINT = (os.getenv("NEWS_ENDPOINT") or "news/").lstrip("/")
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 SITE_BASE_URL = (os.getenv("SITE_BASE_URL") or "https://khobornama.info.bd").rstrip("/")
 API_ORIGIN = f"{urlparse(API_BASE_URL).scheme}://{urlparse(API_BASE_URL).netloc}"
 MAX_NEWS_PER_RUN = int(os.getenv("MAX_NEWS_PER_RUN", "30"))
@@ -187,9 +187,30 @@ def build_caption(article):
     return caption
 
 
-def telegram_send_photo(article):
-    if not article["image"]:
-        raise ValueError(f"Article {article['id']} has no featured image")
+def telegram_send_message(article):
+    endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": build_caption(article),
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    if DRY_RUN:
+        log.info("[DRY RUN] Would publish text-only article %s: %s", article["id"], article["title"])
+        return {"message_id": f"dry-run-{article['id']}"}
+
+    response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Telegram API returned ok=false"))
+    return result["result"]
+
+
+def telegram_publish_article(article):
+    if not article.get("image"):
+        log.info("Article %s has no featured image; posting text-only.", article["id"])
+        return telegram_send_message(article)
 
     endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
     payload = {
@@ -202,17 +223,40 @@ def telegram_send_photo(article):
         log.info("[DRY RUN] Would publish article %s: %s", article["id"], article["title"])
         return {"message_id": f"dry-run-{article['id']}"}
 
-    response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(result.get("description", "Telegram API returned ok=false"))
-    return result["result"]
+    try:
+        response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        result = response.json()
+        if not result.get("ok"):
+            raise RuntimeError(result.get("description", "Telegram API returned ok=false"))
+        return result["result"]
+    except Exception as exc:
+        log.warning(
+            "sendPhoto failed for article %s (%s); attempting text-only fallback...",
+            article["id"],
+            exc,
+        )
+        return telegram_send_message(article)
 
 
 def main():
+    log.info("=== Starting Khobornama Telegram Publisher ===")
+    log.info(
+        "Config: DRY_RUN=%s | MAX_NEWS_PER_RUN=%d | API_BASE_URL=%s | NEWS_ENDPOINT=%s",
+        DRY_RUN,
+        MAX_NEWS_PER_RUN,
+        API_BASE_URL,
+        NEWS_ENDPOINT,
+    )
+
+    if not BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set or empty.")
+    if not CHAT_ID:
+        raise ValueError("TELEGRAM_CHAT_ID environment variable is not set or empty.")
+
     state = load_state()
     posted = set(str(x) for x in state["posted_ids"])
+    log.info("Loaded state: %d previously posted article IDs.", len(posted))
 
     articles = fetch_news()
     log.info("Fetched %d news items from %s", len(articles), API_BASE_URL + NEWS_ENDPOINT)
@@ -229,10 +273,12 @@ def main():
     new_articles = [a for a in normalized if a["id"] not in posted]
     new_articles.reverse()
 
+    log.info("Found %d new articles to publish.", len(new_articles))
+
     success_count = 0
     for article in new_articles:
         try:
-            result = telegram_send_photo(article)
+            result = telegram_publish_article(article)
             if DRY_RUN:
                 log.info("[DRY RUN] Not recording article=%s as posted.", article["id"])
                 continue
