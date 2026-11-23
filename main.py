@@ -267,12 +267,22 @@ def build_facebook_caption(article):
     return "\n\n".join(parts)
 
 
+
 def facebook_post(endpoint, payload):
-    response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
+    response = session.post(
+        endpoint,
+        data=payload,
+        timeout=REQUEST_TIMEOUT
+    )
+
     try:
         data = response.json()
     except Exception:
-        log.error("Facebook endpoint returned non-JSON (%s): %s", response.status_code, response.text[:200])
+        log.error(
+            "Facebook returned non-JSON (%s): %s",
+            response.status_code,
+            response.text[:500]
+        )
         response.raise_for_status()
         raise
 
@@ -281,45 +291,117 @@ def facebook_post(endpoint, payload):
         msg = err.get("message", "Unknown Facebook error")
         code = err.get("code", response.status_code)
         subcode = err.get("error_subcode", "")
-        full_err = f"{code} (subcode {subcode}): {msg}" if subcode else f"{code}: {msg}"
-        print(f"::error title=Facebook API Error::{full_err}", flush=True)
-        log.error("Facebook API Error [%s]: %s", code, msg)
-        raise RuntimeError(f"Facebook API Error: {full_err}")
 
+        full_err = (
+            f"{code} (subcode {subcode}): {msg}"
+            if subcode else f"{code}: {msg}"
+        )
+
+        log.error("Facebook API Error: %s", full_err)
+        raise RuntimeError(full_err)
+
+    response.raise_for_status()
     return data
 
 
 def facebook_publish_article(article):
     caption = build_facebook_caption(article)
-    # Prefer photo post if image is available
-    if article.get("image"):
-        photo_endpoint = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PAGE_ID}/photos"
-        payload = {
-            "url": article["image"],
-            "caption": caption,
-            "access_token": FB_ACCESS_TOKEN,
-        }
-        if DRY_RUN:
-            log.info("[DRY RUN][FB] Would publish photo article %s: %s", article["id"], article["title"])
-            return {"id": f"dry-run-fb-{article['id']}"}
 
-        try:
-            return facebook_post(photo_endpoint, payload)
-        except Exception as exc:
-            log.warning("FB photo post failed for article %s (%s); trying feed fallback...", article["id"], exc)
-
-    # Fallback to feed post with link
-    feed_endpoint = f"https://graph.facebook.com/{FB_API_VERSION}/{FB_PAGE_ID}/feed"
-    payload = {
-        "message": caption,
-        "link": article["url"],
-        "access_token": FB_ACCESS_TOKEN,
-    }
     if DRY_RUN:
-        log.info("[DRY RUN][FB] Would publish feed article %s: %s", article["id"], article["title"])
+        log.info(
+            "[DRY RUN][FB] Would publish article %s: %s",
+            article["id"],
+            article["title"]
+        )
         return {"id": f"dry-run-fb-{article['id']}"}
 
-    return facebook_post(feed_endpoint, payload)
+    # Step 1: Upload image as unpublished photo
+    if article.get("image"):
+        photo_endpoint = (
+            f"https://graph.facebook.com/"
+            f"{FB_API_VERSION}/{FB_PAGE_ID}/photos"
+        )
+
+        photo_payload = {
+            "url": article["image"],
+            "published": "false",
+            "access_token": FB_ACCESS_TOKEN,
+        }
+
+        photo_result = facebook_post(
+            photo_endpoint,
+            photo_payload
+        )
+
+        photo_id = photo_result.get("id")
+
+        if not photo_id:
+            raise RuntimeError(
+                f"Facebook image upload returned no photo ID: {photo_result}"
+            )
+
+        log.info(
+            "[Facebook] Image uploaded successfully. Photo ID=%s",
+            photo_id
+        )
+
+        # Step 2: Create an actual Page Feed post with the photo
+        feed_endpoint = (
+            f"https://graph.facebook.com/"
+            f"{FB_API_VERSION}/{FB_PAGE_ID}/feed"
+        )
+
+        feed_payload = {
+            "message": caption,
+            "attached_media[0]": json.dumps({
+                "media_fbid": photo_id
+            }),
+            "published": "true",
+            "access_token": FB_ACCESS_TOKEN,
+        }
+
+        result = facebook_post(
+            feed_endpoint,
+            feed_payload
+        )
+
+        post_id = result.get("id")
+
+        if not post_id:
+            raise RuntimeError(
+                f"Facebook Feed returned no post ID: {result}"
+            )
+
+        log.info(
+            "[Facebook] Page Feed post published successfully. "
+            "Post ID=%s | Photo ID=%s",
+            post_id,
+            photo_id
+        )
+
+        return result
+
+    # Step 3: Text/link post when no image is available
+    feed_endpoint = (
+        f"https://graph.facebook.com/"
+        f"{FB_API_VERSION}/{FB_PAGE_ID}/feed"
+    )
+
+    feed_payload = {
+        "message": caption,
+        "link": article["url"],
+        "published": "true",
+        "access_token": FB_ACCESS_TOKEN,
+    }
+
+    result = facebook_post(feed_endpoint, feed_payload)
+
+    log.info(
+        "[Facebook] Text/link post published. Post ID=%s",
+        result.get("id")
+    )
+
+    return result
 
 
 def publish_channel(channel_name, normalized_articles, state_file, publish_func):
