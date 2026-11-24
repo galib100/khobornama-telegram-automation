@@ -125,7 +125,7 @@ def article_fields(item):
         image = image.get("url", "")
 
     if not article_url and slug:
-        article_url = f"/news/{slug}/"
+        article_url = f"/newsDetails/{slug}/"
 
     return {
         "id": str(article_id) if article_id is not None else "",
