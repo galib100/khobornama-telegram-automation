@@ -16,8 +16,12 @@ from datetime import datetime
 import random
 import requests
 
-from generator_core import get_browser_path, image_to_base64, render_html_to_image
-from templates import DESIGN_TEMPLATES, DESIGN_NAMES
+try:
+    from .generator_core import get_browser_path, image_to_base64, render_html_to_image
+    from .templates import DESIGN_TEMPLATES, DESIGN_NAMES
+except (ImportError, ValueError):
+    from generator_core import get_browser_path, image_to_base64, render_html_to_image
+    from templates import DESIGN_TEMPLATES, DESIGN_NAMES
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -126,10 +130,11 @@ class PhotocardGenerator:
         log.info(f"Generated photocard [{DESIGN_NAMES[design_idx]}]: {output_path}")
         return output_path
 
-    def generate_bulk(self, articles, output_dir=None, design_mode="cycle", card_size=(1080, 1140)):
+    def generate_bulk(self, articles, output_dir=None, design_mode="split_10", card_size=(1080, 1140)):
         """
         Generate photocards in bulk.
         design_mode:
+          - 'split_10' or 'split': 1st 10 articles in Design 0 (Jamuna), remaining in Design 1 (Somoy)
           - 'cycle': Alternates between 0 (Jamuna) and 1 (Somoy)
           - 'random': Random choice between 0 (Jamuna) and 1 (Somoy)
           - 'all': Generate both designs for every article
@@ -142,7 +147,13 @@ class PhotocardGenerator:
         generated = []
         for idx, article in enumerate(articles):
             art_id = article.get("id", f"art_{idx+1}")
-            if design_mode == "all":
+            if design_mode in ("split_10", "split"):
+                # First 10 in Design 0 (Jamuna), last 10 (or next) in Design 1 (Somoy)
+                d = 0 if idx < 10 else 1
+                card_path = out_dir / f"card_{art_id}_design_{d}.png"
+                self.generate_card(article, design=d, output_path=card_path, card_size=card_size)
+                generated.append(card_path)
+            elif design_mode == "all":
                 for d in range(len(DESIGN_NAMES)):
                     card_path = out_dir / f"card_{art_id}_design_{d}.png"
                     self.generate_card(article, design=d, output_path=card_path, card_size=card_size)
@@ -189,8 +200,8 @@ def main():
     parser.add_argument("--count", type=int, default=5, help="Number of articles to process from API")
     parser.add_argument(
         "--design",
-        default="cycle",
-        help="Design mode: '0', '1', 'jamuna', 'somoy', 'cycle', 'random', or 'all'",
+        default="split_10",
+        help="Design mode: 'split_10' (first 10 in design 0, last 10 in design 1), 'cycle', 'random', '0' ('jamuna'), '1' ('somoy'), or 'all'",
     )
     parser.add_argument("--sample", action="store_true", help="Generate sample photocards for the 2 chosen designs")
     parser.add_argument("--outdir", default=str(OUTPUT_DIR), help="Output directory for generated photocards")

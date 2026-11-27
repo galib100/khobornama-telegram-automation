@@ -31,6 +31,16 @@ FB_STATE_FILE = Path(os.getenv("FB_STATE_FILE", "data/posted_facebook_ids.json")
 FB_API_VERSION = os.getenv("FB_API_VERSION", "v21.0")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+ENABLE_PHOTOCARD = os.getenv("ENABLE_PHOTOCARD", "true").lower() == "true"
+
+card_generator = None
+if ENABLE_PHOTOCARD:
+    try:
+        from demo_forc_card_gen.photocard_generator import PhotocardGenerator
+        card_generator = PhotocardGenerator()
+        log.info("[Photocard] PhotocardGenerator initialized successfully.")
+    except Exception as exc:
+        log.warning("[Photocard] Could not initialize PhotocardGenerator (%s); falling back to raw images.", exc)
 
 session = requests.Session()
 session.headers.update({"User-Agent": "KhobornamaTelegramPublisher/1.0"})
@@ -138,6 +148,7 @@ def article_fields(item):
         ),
         "url": absolute_url(article_url) if article_url else SITE_BASE_URL,
         "published_at": first_value(item, "published_at", "created_at", "date"),
+        "source": item.get("source") or {},
     }
 
 
@@ -194,8 +205,13 @@ def build_caption(article):
     return caption
 
 
-def telegram_post(endpoint, payload):
-    response = session.post(endpoint, data=payload, timeout=REQUEST_TIMEOUT)
+def telegram_post(endpoint, payload=None, files=None):
+    response = session.post(
+        endpoint,
+        data=payload,
+        files=files,
+        timeout=REQUEST_TIMEOUT
+    )
     try:
         data = response.json()
     except Exception:
@@ -228,23 +244,41 @@ def telegram_send_message(article):
 
 
 def telegram_publish_article(article):
-    if not article.get("image"):
-        log.info("Article %s has no featured image; posting text-only.", article["id"])
+    photocard = article.get("photocard_path")
+    has_local_card = photocard and os.path.exists(photocard)
+    image_url = article.get("image")
+
+    if not has_local_card and not image_url:
+        log.info("Article %s has neither photocard nor image; posting text-only.", article["id"])
         return telegram_send_message(article)
 
     endpoint = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-    payload = {
-        "chat_id": CHAT_ID,
-        "photo": article["image"],
-        "caption": build_caption(article),
-        "parse_mode": "HTML",
-    }
+    caption = build_caption(article)
+
     if DRY_RUN:
-        log.info("[DRY RUN] Would publish article %s: %s", article["id"], article["title"])
+        log.info(
+            "[DRY RUN] Would publish article %s: %s (card=%s, img=%s)",
+            article["id"],
+            article["title"],
+            bool(has_local_card),
+            bool(image_url),
+        )
         return {"message_id": f"dry-run-{article['id']}"}
 
+    payload = {
+        "chat_id": CHAT_ID,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+
     try:
-        return telegram_post(endpoint, payload)
+        if has_local_card:
+            with open(photocard, "rb") as f:
+                files = {"photo": (Path(photocard).name, f, "image/png")}
+                return telegram_post(endpoint, payload, files=files)
+        else:
+            payload["photo"] = image_url
+            return telegram_post(endpoint, payload)
     except Exception as exc:
         log.warning(
             "sendPhoto failed for article %s (%s); attempting text-only fallback...",
@@ -268,10 +302,11 @@ def build_facebook_caption(article):
 
 
 
-def facebook_post(endpoint, payload):
+def facebook_post(endpoint, payload=None, files=None):
     response = session.post(
         endpoint,
         data=payload,
+        files=files,
         timeout=REQUEST_TIMEOUT
     )
 
@@ -315,23 +350,41 @@ def facebook_publish_article(article):
         )
         return {"id": f"dry-run-fb-{article['id']}"}
 
-    # Step 1: Upload image as unpublished photo
-    if article.get("image"):
+    photocard = article.get("photocard_path")
+    has_local_card = photocard and os.path.exists(photocard)
+    image_url = article.get("image")
+
+    # Step 1: Upload image as unpublished photo (local photocard or remote image URL)
+    if has_local_card or image_url:
         photo_endpoint = (
             f"https://graph.facebook.com/"
             f"{FB_API_VERSION}/{FB_PAGE_ID}/photos"
         )
 
-        photo_payload = {
-            "url": article["image"],
-            "published": "false",
-            "access_token": FB_ACCESS_TOKEN,
-        }
-
-        photo_result = facebook_post(
-            photo_endpoint,
-            photo_payload
-        )
+        if has_local_card:
+            photo_payload = {
+                "published": "false",
+                "access_token": FB_ACCESS_TOKEN,
+            }
+            with open(photocard, "rb") as f:
+                photo_files = {
+                    "source": (Path(photocard).name, f, "image/png")
+                }
+                photo_result = facebook_post(
+                    photo_endpoint,
+                    payload=photo_payload,
+                    files=photo_files
+                )
+        else:
+            photo_payload = {
+                "url": image_url,
+                "published": "false",
+                "access_token": FB_ACCESS_TOKEN,
+            }
+            photo_result = facebook_post(
+                photo_endpoint,
+                payload=photo_payload
+            )
 
         photo_id = photo_result.get("id")
 
@@ -362,7 +415,7 @@ def facebook_publish_article(article):
 
         result = facebook_post(
             feed_endpoint,
-            feed_payload
+            payload=feed_payload
         )
 
         post_id = result.get("id")
@@ -394,7 +447,7 @@ def facebook_publish_article(article):
         "access_token": FB_ACCESS_TOKEN,
     }
 
-    result = facebook_post(feed_endpoint, feed_payload)
+    result = facebook_post(feed_endpoint, payload=feed_payload)
 
     log.info(
         "[Facebook] Text/link post published. Post ID=%s",
@@ -423,6 +476,32 @@ def publish_channel(channel_name, normalized_articles, state_file, publish_func)
         new_articles = new_articles[:MAX_NEWS_PER_RUN]
 
     log.info("[%s] Publishing %d articles in this run (total new discovered: %d).", channel_name, len(new_articles), total_new)
+
+    # Photocard generation: 1st 10 in Design 0 (Jamuna), next 10 in Design 1 (Somoy)
+    if card_generator:
+        for idx, article in enumerate(new_articles):
+            if article.get("photocard_path") and os.path.exists(article["photocard_path"]):
+                continue
+            design_idx = 0 if idx < 10 else 1
+            try:
+                card_path = card_generator.generate_card(article, design=design_idx)
+                article["photocard_path"] = str(card_path)
+                article["photocard_design"] = design_idx
+                log.info(
+                    "[Photocard][%d/%d] Generated card for article=%s design=%d (%s)",
+                    idx + 1,
+                    len(new_articles),
+                    article["id"],
+                    design_idx,
+                    card_path,
+                )
+            except Exception as exc:
+                log.warning(
+                    "[Photocard] Failed generating card for article=%s (design %d): %s",
+                    article["id"],
+                    design_idx,
+                    exc,
+                )
 
     success_count = 0
     for idx, article in enumerate(new_articles):

@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import base64
 import json
 import logging
@@ -11,15 +12,37 @@ from PIL import Image
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("CardGen")
 
-EDGE_PATHS = [
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-]
-
 def get_browser_path():
-    for p in EDGE_PATHS:
+    env_browser = os.getenv("CHROME_PATH") or os.getenv("BROWSER_PATH")
+    if env_browser and os.path.exists(env_browser):
+        return env_browser
+
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "msedge", "chrome"):
+        p = shutil.which(name)
+        if p and os.path.exists(p):
+            return p
+
+    candidates = [
+        # macOS
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        # Linux
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/snap/bin/chromium",
+        # Windows
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Edge\Application\msedge.exe"),
+    ]
+    for p in candidates:
         if os.path.exists(p):
             return p
     return None
@@ -54,14 +77,20 @@ def render_html_to_image(html_str, output_path, width=1080, height=1140):
     tmp_html.write_text(html_str, encoding="utf-8")
     
     # On Windows, headless Chromium window-size includes ~24px width and ~93px height
-    # of non-client window frame. We offset the window size to guarantee exact inner viewport.
-    win_w = width + 24
-    win_h = height + 93
+    # of non-client window frame. On Linux/macOS, window-size matches viewport directly.
+    if sys.platform == "win32":
+        win_w = width + 24
+        win_h = height + 93
+    else:
+        win_w = width
+        win_h = height
     
     cmd = [
         browser,
         "--headless=new",
         "--disable-gpu",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
         "--hide-scrollbars",
         f"--window-size={win_w},{win_h}",
         f"--screenshot={output_path.resolve()}",

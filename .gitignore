@@ -3,3 +3,6 @@ __pycache__/
 venv/
 .env
 *.pyc
+*.tmp.html
+.DS_Store
+demo_forc_card_gen/output/card_*.png
