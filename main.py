@@ -31,6 +31,7 @@ FB_STATE_FILE = Path(os.getenv("FB_STATE_FILE", "data/posted_facebook_ids.json")
 FB_API_VERSION = os.getenv("FB_API_VERSION", "v21.0")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+POST_DELAY_SECONDS = int(os.getenv("POST_DELAY_SECONDS", "300"))
 ENABLE_PHOTOCARD = os.getenv("ENABLE_PHOTOCARD", "true").lower() == "true"
 
 card_generator = None
@@ -457,27 +458,65 @@ def facebook_publish_article(article):
     return result
 
 
-def publish_channel(channel_name, normalized_articles, state_file, publish_func):
-    state = load_state(state_file)
-    posted = set(str(x) for x in state["posted_ids"])
-    log.info("[%s] Loaded state: %d previously posted article IDs.", channel_name, len(posted))
+def publish_all_channels(normalized_articles):
+    tg_enabled = bool(BOT_TOKEN and CHAT_ID)
+    fb_enabled = bool(FB_PAGE_ID and FB_ACCESS_TOKEN)
 
-    new_articles = [a for a in normalized_articles if a["id"] not in posted]
+    if not tg_enabled and not fb_enabled:
+        log.info("Neither Telegram nor Facebook credentials configured; nothing to publish.")
+        return 0
+
+    if tg_enabled:
+        masked_token = (BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:]) if len(BOT_TOKEN) > 10 else "(too short)"
+        log.info("[Telegram] Configured: CHAT_ID=%s | BOT_TOKEN=%s", CHAT_ID, masked_token)
+    else:
+        log.info("[Telegram] BOT_TOKEN or CHAT_ID not set; skipping Telegram.")
+
+    if fb_enabled:
+        masked_fb_token = (FB_ACCESS_TOKEN[:6] + "..." + FB_ACCESS_TOKEN[-4:]) if len(FB_ACCESS_TOKEN) > 10 else "(too short)"
+        log.info("[Facebook] Configured: PAGE_ID=%s | TOKEN=%s", FB_PAGE_ID, masked_fb_token)
+    else:
+        log.info("[Facebook] FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN not set; skipping Facebook.")
+
+    tg_state = load_state(STATE_FILE) if tg_enabled else {"posted_ids": []}
+    fb_state = load_state(FB_STATE_FILE) if fb_enabled else {"posted_ids": []}
+
+    tg_posted = set(str(x) for x in tg_state.get("posted_ids", []))
+    fb_posted = set(str(x) for x in fb_state.get("posted_ids", []))
+
+    log.info(
+        "Loaded states: Telegram has %d posted IDs, Facebook has %d posted IDs.",
+        len(tg_posted),
+        len(fb_posted),
+    )
+
+    # Collect articles that need to be published in at least one active channel
+    new_articles = []
+    for a in normalized_articles:
+        needs_tg = tg_enabled and (a["id"] not in tg_posted)
+        needs_fb = fb_enabled and (a["id"] not in fb_posted)
+        if needs_tg or needs_fb:
+            new_articles.append(a)
+
     new_articles.reverse()
 
     total_new = len(new_articles)
     if total_new > MAX_NEWS_PER_RUN:
         log.info(
-            "[%s] Found %d new articles; capping to oldest %d for this run.",
-            channel_name,
+            "Found %d new articles across channels; capping to oldest %d for this run.",
             total_new,
             MAX_NEWS_PER_RUN,
         )
         new_articles = new_articles[:MAX_NEWS_PER_RUN]
 
-    log.info("[%s] Publishing %d articles in this run (total new discovered: %d).", channel_name, len(new_articles), total_new)
+    log.info(
+        "Publishing up to %d articles in this run (delay between posts: %d seconds / %.1f mins).",
+        len(new_articles),
+        POST_DELAY_SECONDS,
+        POST_DELAY_SECONDS / 60,
+    )
 
-    # Photocard generation: 1st 10 in Design 0 (Jamuna), next 10 in Design 1 (Somoy)
+    # 1. Photocard generation: 1st 10 in Design 0 (Jamuna), next 10 in Design 1 (Somoy)
     if card_generator:
         for idx, article in enumerate(new_articles):
             if article.get("photocard_path") and os.path.exists(article["photocard_path"]):
@@ -503,50 +542,79 @@ def publish_channel(channel_name, normalized_articles, state_file, publish_func)
                     exc,
                 )
 
-    success_count = 0
-    for idx, article in enumerate(new_articles):
-        try:
-            result = publish_func(article)
-            if DRY_RUN:
-                log.info("[DRY RUN][%s] Not recording article=%s as posted.", channel_name, article["id"])
-                continue
-            posted.add(article["id"])
-            success_count += 1
-            post_id = result.get("id") or result.get("post_id") or result.get("message_id")
-            log.info(
-                "[%s][%d/%d] Published article=%s post_id=%s",
-                channel_name,
-                idx + 1,
-                len(new_articles),
-                article["id"],
-                post_id,
-            )
-            state["posted_ids"] = sorted(posted)
-            save_state(state, state_file)
+    # 2. Sequential posting across channels with delay between articles
+    success_tg = 0
+    success_fb = 0
 
-            # Polite delay between posts to prevent rate-limiting
-            if idx < len(new_articles) - 1 and not DRY_RUN:
-                time.sleep(2)
-        except Exception:
-            log.exception("[%s] Failed to publish article=%s title=%s", channel_name, article["id"], article["title"])
-            raise
+    for idx, article in enumerate(new_articles):
+        art_id = article["id"]
+        log.info(
+            "[Post][%d/%d] Publishing article=%s: %s",
+            idx + 1,
+            len(new_articles),
+            art_id,
+            article["title"],
+        )
+
+        # Publish to Telegram
+        if tg_enabled and (art_id not in tg_posted):
+            try:
+                tg_result = telegram_publish_article(article)
+                if DRY_RUN:
+                    log.info("[DRY RUN][Telegram] Published article=%s", art_id)
+                else:
+                    tg_posted.add(art_id)
+                    tg_state["posted_ids"] = sorted(tg_posted)
+                    save_state(tg_state, STATE_FILE)
+                    success_tg += 1
+                    msg_id = tg_result.get("message_id") if isinstance(tg_result, dict) else None
+                    log.info("[Telegram][%d/%d] Success article=%s msg_id=%s", idx + 1, len(new_articles), art_id, msg_id)
+            except Exception as exc:
+                log.exception("[Telegram] Failed article=%s: %s", art_id, exc)
+
+        # Publish to Facebook
+        if fb_enabled and (art_id not in fb_posted):
+            try:
+                fb_result = facebook_publish_article(article)
+                if DRY_RUN:
+                    log.info("[DRY RUN][Facebook] Published article=%s", art_id)
+                else:
+                    fb_posted.add(art_id)
+                    fb_state["posted_ids"] = sorted(fb_posted)
+                    save_state(fb_state, FB_STATE_FILE)
+                    success_fb += 1
+                    post_id = fb_result.get("id") if isinstance(fb_result, dict) else None
+                    log.info("[Facebook][%d/%d] Success article=%s post_id=%s", idx + 1, len(new_articles), art_id, post_id)
+            except Exception as exc:
+                log.exception("[Facebook] Failed article=%s: %s", art_id, exc)
+
+        # Interval between posts (5 minutes by default)
+        if idx < len(new_articles) - 1 and not DRY_RUN:
+            log.info(
+                "Waiting %d seconds (%.1f minutes) before publishing article %d/%d...",
+                POST_DELAY_SECONDS,
+                POST_DELAY_SECONDS / 60,
+                idx + 2,
+                len(new_articles),
+            )
+            time.sleep(POST_DELAY_SECONDS)
 
     log.info(
-        "[%s] Finished. Attempted=%d published=%d already_posted=%d",
-        channel_name,
+        "Finished multi-channel publication. Processed=%d | Telegram new=%d | Facebook new=%d",
         len(new_articles),
-        success_count,
-        len(normalized_articles) - total_new,
+        success_tg,
+        success_fb,
     )
-    return success_count
+    return max(success_tg, success_fb)
 
 
 def main():
     log.info("=== Starting Khobornama Multi-Channel Auto Publisher ===")
     log.info(
-        "Config: DRY_RUN=%s | MAX_NEWS_PER_RUN=%d | API_BASE_URL=%s | NEWS_ENDPOINT=%s",
+        "Config: DRY_RUN=%s | MAX_NEWS_PER_RUN=%d | POST_DELAY_SECONDS=%d | API_BASE_URL=%s | NEWS_ENDPOINT=%s",
         DRY_RUN,
         MAX_NEWS_PER_RUN,
+        POST_DELAY_SECONDS,
         API_BASE_URL,
         NEWS_ENDPOINT,
     )
@@ -562,32 +630,7 @@ def main():
             continue
         normalized.append(article)
 
-    errors = []
-
-    # 1. Telegram Publication
-    if BOT_TOKEN and CHAT_ID:
-        masked_token = (BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:]) if len(BOT_TOKEN) > 10 else "(too short)"
-        log.info("[Telegram] Credentials OK: CHAT_ID=%s | BOT_TOKEN=%s (len=%d)", CHAT_ID, masked_token, len(BOT_TOKEN))
-        try:
-            publish_channel("Telegram", normalized, STATE_FILE, telegram_publish_article)
-        except Exception as exc:
-            errors.append(f"Telegram failed: {exc}")
-    else:
-        log.info("[Telegram] BOT_TOKEN or CHAT_ID not set; skipping Telegram.")
-
-    # 2. Facebook Page Publication
-    if FB_PAGE_ID and FB_ACCESS_TOKEN:
-        masked_fb_token = (FB_ACCESS_TOKEN[:6] + "..." + FB_ACCESS_TOKEN[-4:]) if len(FB_ACCESS_TOKEN) > 10 else "(too short)"
-        log.info("[Facebook] Credentials OK: PAGE_ID=%s | TOKEN=%s (len=%d)", FB_PAGE_ID, masked_fb_token, len(FB_ACCESS_TOKEN))
-        try:
-            publish_channel("Facebook", normalized, FB_STATE_FILE, facebook_publish_article)
-        except Exception as exc:
-            errors.append(f"Facebook failed: {exc}")
-    else:
-        log.info("[Facebook] FACEBOOK_PAGE_ID or FACEBOOK_PAGE_ACCESS_TOKEN not set; skipping Facebook.")
-
-    if errors:
-        raise RuntimeError(" | ".join(errors))
+    publish_all_channels(normalized)
 
 
 if __name__ == "__main__":

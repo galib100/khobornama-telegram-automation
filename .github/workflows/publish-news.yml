@@ -28,7 +28,7 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -57,11 +57,12 @@ jobs:
           STATE_FILE: "data/posted_ids.json"
           FB_STATE_FILE: "data/posted_facebook_ids.json"
           MAX_NEWS_PER_RUN: "20"
+          POST_DELAY_SECONDS: ${{ secrets.POST_DELAY_SECONDS || vars.POST_DELAY_SECONDS || '300' }}
           DRY_RUN: ${{ (github.event_name == 'workflow_dispatch' && (inputs.dry_run == true || inputs.dry_run == 'true')) && 'true' || 'false' }}
         run: python main.py
 
       - name: Commit updated publication state
-        if: success()
+        if: always()
         run: |
           if git diff --quiet -- data/; then
             echo "No state changes."
