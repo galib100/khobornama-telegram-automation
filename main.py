@@ -33,6 +33,11 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 POST_DELAY_SECONDS = int(os.getenv("POST_DELAY_SECONDS", "300"))
 ENABLE_PHOTOCARD = os.getenv("ENABLE_PHOTOCARD", "true").lower() == "true"
+EXCLUDED_SOURCES = {
+    s.strip().lower()
+    for s in os.getenv("EXCLUDED_SOURCES", "কালবেলা,kalbela").split(",")
+    if s.strip()
+}
 
 card_generator = None
 if ENABLE_PHOTOCARD:
@@ -623,12 +628,23 @@ def main():
     log.info("Fetched %d news items from %s", len(articles), API_BASE_URL + NEWS_ENDPOINT)
 
     normalized = []
+    skipped_sources = 0
     for raw in articles:
         article = article_fields(raw)
         if not article["id"]:
             log.warning("Skipping item without id: %s", raw)
             continue
+        source_data = article.get("source") or {}
+        source_name = (
+            source_data.get("name", "") if isinstance(source_data, dict) else str(source_data)
+        ).strip().lower()
+        if source_name and any(ex in source_name for ex in EXCLUDED_SOURCES):
+            skipped_sources += 1
+            continue
         normalized.append(article)
+
+    if skipped_sources:
+        log.info("Skipped %d articles from excluded sources (%s).", skipped_sources, ", ".join(sorted(EXCLUDED_SOURCES)))
 
     publish_all_channels(normalized)
 

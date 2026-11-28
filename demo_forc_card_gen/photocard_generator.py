@@ -105,8 +105,8 @@ class PhotocardGenerator:
         if isinstance(image_url, dict):
             image_url = image_url.get("url", "")
 
-        # Fetch base64 of images
-        image_b64 = image_to_base64(image_url) if image_url else self.logo_b64
+        # Fetch base64 of images (always fall back to Khobornama logo if fetch fails)
+        image_b64 = (image_to_base64(image_url) if image_url else "") or self.logo_b64
         source_logo_b64 = image_to_base64(source_logo_url) if source_logo_url else ""
 
         html = template_func(

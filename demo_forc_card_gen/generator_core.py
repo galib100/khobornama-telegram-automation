@@ -52,11 +52,23 @@ def image_to_base64(url_or_path, timeout=10):
         return ""
     try:
         if str(url_or_path).startswith(("http://", "https://")):
-            r = requests.get(url_or_path, timeout=timeout)
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            }
+            r = requests.get(url_or_path, headers=headers, timeout=timeout)
             if r.status_code == 200:
-                ct = r.headers.get("content-type", "image/jpeg")
+                ct = r.headers.get("content-type", "").split(";")[0].strip().lower()
+                if not ct.startswith("image/"):
+                    logger.warning(f"Non-image content-type ({ct}) for {url_or_path}")
+                    return ""
                 b64 = base64.b64encode(r.content).decode("utf-8")
                 return f"data:{ct};base64,{b64}"
+            logger.warning(f"Image fetch returned HTTP {r.status_code} for {url_or_path}")
         else:
             path = Path(url_or_path)
             if path.exists():
